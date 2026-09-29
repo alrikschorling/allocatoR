@@ -2,4 +2,5 @@
 source("tests/helper.R")
 run_suite(c("tests/test-allocation.R",
             "tests/test-statistics.R",
-            "tests/test-validation.R"))
+            "tests/test-validation.R",
+            "tests/test-manifest.R"))
