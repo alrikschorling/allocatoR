@@ -1,11 +1,20 @@
 # Set up
-#load packages
-pacman::p_load(shiny, shinyFeedback, shinythemes, shinyjs, #shiny-related
-               DT, #modifiable tables
-               tidyverse, dplyr, #data manipulation
-               ggplot2, ggridges, #plotting 
-               anticlust, #anticlustering (allocation)
-               ggpubr, rstatix, ggprism) #statistics
+# Load packages
+# Declared explicitly rather than via pacman::p_load() so that dependencies are
+# discoverable by renv/rsconnect and nothing is installed at runtime on the
+# server. ggpubr was declared previously but never used.
+library(shiny)          # app framework
+library(shinyFeedback)  # inline input validation
+library(shinythemes)    # bootswatch themes
+library(shinyjs)        # enable/disable controls
+library(DT)             # interactive tables
+library(dplyr)          # data manipulation
+library(tidyr)          # pivot_longer()
+library(ggplot2)        # plotting
+library(ggridges)       # geom_density_ridges()
+library(anticlust)      # balanced group allocation
+library(rstatix)        # statistical tests
+library(ggprism)        # add_pvalue()
 
 #set themes and palettes
 basic_theme <- theme_bw() + 
@@ -37,14 +46,11 @@ expanded_pal <- colorRampPalette(pal)(50)
 expanded_pal2 <- colorRampPalette(pal2)(50)
 
 
-#create function to subsample colors based on the number of levels of factors of interest
-get_subsampled_palette <- function(n) {
-  expanded_pal[round(seq(1, length(expanded_pal), length.out = n))]
-}
-
-#create function to subsample colors based on the number of levels of factors of interest
-get_subsampled_palette <- function(n) {
-  expanded_pal2[round(seq(1, length(expanded_pal), length.out = n))]
+#subsample a colour ramp down to the number of factor levels actually present.
+#Defaults to expanded_pal2, which is what the app used before this was
+#de-duplicated; pass `palette` explicitly to draw from the other ramp.
+get_subsampled_palette <- function(n, palette = expanded_pal2) {
+  palette[round(seq(1, length(palette), length.out = n))]
 }
 
 #generate example data that matches the format users should upload
@@ -129,8 +135,8 @@ ui <- fluidPage(
               placeholder = "Eg. Lesion, Control"),  # Comma-separated input
     textInput("group_sizes", "Number of rats in each group (comma-separated)", 
               placeholder = "E.g. 5,5"),  # Comma-separated input for sizes
-    selectInput("set_seed", "Set seed (for reproducibility)", 
-                choices = c(123, 69, 111), selected = 123),
+    numericInput("set_seed", "Set seed (for reproducibility)",
+                 value = 123, step = 1),
     
     #action buttons
     actionButton("process_data", "Process Data", class = "btn-primary"),
@@ -160,19 +166,53 @@ server <- function(input, output, session) {
     example_table
   })
   
-  #initially disable download buttons
-  shinyjs::disable("downloadData1")
-  shinyjs::disable("downloadData2")
-  shinyjs::disable("downloadData3")
-  shinyjs::disable("downloadAllocation")
+  #Download buttons stay disabled until the data has actually been processed.
+  #These must be driven by an observer -- calling enable() at the top level of
+  #server() fires once at session start, immediately undoing the disable.
+  download_buttons <- c("downloadData1", "downloadData2",
+                        "downloadData3", "downloadAllocation")
+  lapply(download_buttons, shinyjs::disable)
+  observeEvent(processed_data(), lapply(download_buttons, shinyjs::enable))
   
   #function to read and process CSV files
   df <- reactive({
     req(input$file1)
-    files <- input$file1
-    df <- read.csv(files$datapath) |> 
-      rename_with(tolower) |>
-      mutate(rat_id = factor(rat_id)) 
+    shinyFeedback::hideFeedback("file1")
+
+    raw <- tryCatch(read.csv(input$file1$datapath), error = function(e) e)
+    #need() evaluates its message eagerly, so the message has to be extracted
+    #before the check rather than inside it
+    read_error <- if (inherits(raw, "error")) conditionMessage(raw) else NULL
+    validate(need(is.null(read_error),
+                  paste("Could not read the CSV file:", read_error)))
+
+    raw <- raw |> rename_with(tolower)
+
+    #Check the shape up front. Without this, a missing rat_id surfaces as an
+    #obscure dplyr error and a non-numeric column silently turns the whole
+    #value column into text once the data is pivoted to long format.
+    validate(
+      need("rat_id" %in% names(raw),
+           paste("The first column must be named 'rat_id'. Found:",
+                 paste(names(raw), collapse = ", "))),
+      need(ncol(raw) >= 2,
+           "The file needs at least one behavioural measure besides 'rat_id'.")
+    )
+
+    measures <- setdiff(names(raw), "rat_id")
+    non_numeric <- measures[!vapply(raw[measures], is.numeric, logical(1))]
+    validate(
+      need(length(non_numeric) == 0,
+           paste0("Every column except 'rat_id' must be numeric. ",
+                  "These are not: ", paste(non_numeric, collapse = ", "),
+                  ". Check that the file uses dots as decimal separators ",
+                  "and commas as cell separators.")),
+      need(!anyNA(raw[measures]),
+           "The behavioural measures contain missing values; anticlustering needs a complete table."),
+      need(!anyDuplicated(raw$rat_id), "rat_id values must be unique.")
+    )
+
+    raw |> mutate(rat_id = factor(rat_id))
   })
   
   #display unique number of rat_id
@@ -188,6 +228,7 @@ server <- function(input, output, session) {
     group_sizes <- as.numeric(strsplit(input$group_sizes, ",\\s*")[[1]])
     
     #set the seed (for reproducibility)
+    req(input$set_seed)
     set.seed(input$set_seed)
     
     #validate that group sizes and number of names matches the input number of groups
@@ -209,7 +250,6 @@ server <- function(input, output, session) {
       method = "local-maximum" #algorithm endpoint: local maximum method 
     ), labels = group_names)  #apply user-defined group names
     
-    shinyjs::enable("downloadAllocation")
     df_with_groups
   })
   
@@ -219,86 +259,87 @@ server <- function(input, output, session) {
       mutate(test = factor(test)) |> ungroup()
   })
   
-  # perform statistical tests
-  #shapiro-wilk test
+  # ---- Assumption checks -------------------------------------------------
+  # Run PER behavioural test. Pooling every test into one vector compares a
+  # mixture of variables measured on different scales, which rejects normality
+  # for reasons that have nothing to do with the data.
+
+  #shapiro-wilk test for normality, one per behavioural test
   shapiro <- reactive({
-    result <- shapiro_test(df_long()$vals)
+    df_long() |> group_by(test) |> shapiro_test(vals) |> ungroup()
   })
-  
+
   output$shapiro_result <- renderText({
-    shapiro_result <- shapiro()
-    
-    paste(
-      "Shapiro-Wilk Test for Normality\n",
-      "Statistic:", round(shapiro_result$statistic, 3), "\n",
-      "p-value:", ifelse(!is.null(shapiro_result$p.value), round(shapiro_result$p.value, 6), "NA")
+    res <- shapiro()
+    paste0(
+      "Shapiro-Wilk test for normality (per behavioural test)\n",
+      paste(sprintf("  %-10s W = %.3f, p = %.4f%s",
+                    res$test, res$statistic, res$p,
+                    ifelse(res$p < 0.05, "  *", "")), collapse = "\n"),
+      "\n  * p < 0.05: departs from normality"
     )
   })
-  
-  #levene's test
+
+  #levene's test for homogeneity of variance, one per behavioural test
   levene <- reactive({
-    levene_test(vals ~ group, data = df_long())
+    df_long() |> group_by(test) |> levene_test(vals ~ group) |> ungroup()
   })
-  
+
   output$levene_result <- renderText({
-    levene_result <- levene()
-    
-    paste(
-      "Levene's Test for Homogeneity of Variance\n",
-      "Statistic:", round(levene_result$statistic, 3), "\n",
-      "Degrees of freedom:", levene_result$df1, ",", levene_result$df2, "\n",
-      "p-value:", ifelse(!is.null(levene_result$p), round(levene_result$p, 3), "NA")
+    res <- levene()
+    paste0(
+      "Levene's test for homogeneity of variance (per behavioural test)\n",
+      paste(sprintf("  %-10s F(%d, %d) = %.3f, p = %.4f%s",
+                    res$test, res$df1, res$df2, res$statistic, res$p,
+                    ifelse(res$p < 0.05, "  *", "")), collapse = "\n"),
+      "\n  * p < 0.05: unequal variance between groups"
     )
   })
-  
-  
-  test_used <- reactiveVal("")
-  
+
+  #Summarise assumptions across behavioural tests. One test family is applied
+  #to every panel, so the strictest result governs: if ANY behavioural test
+  #violates an assumption, the more conservative method is used.
+  assumptions <- reactive({
+    list(normal        = all(shapiro()$p >= 0.05),
+         homoskedastic = all(levene()$p  >= 0.05))
+  })
+
+  #decide which downstream test to run
+  stat_choice <- reactive({
+    a <- assumptions()
+    k <- length(unique(df_long()$group))
+
+    if      (!a$normal && k > 2)  "dunn"
+    else if (!a$normal)           "wilcox"
+    else if (!a$homoskedastic)    "welch"
+    else                          "student"
+  })
+
+  test_labels <- c(
+    dunn    = "Dunn's non-parametric multiple comparison test (BH-adjusted)",
+    wilcox  = "Wilcoxon rank-sum test (non-parametric)",
+    welch   = "Welch's t-test (unequal variance)",
+    student = "Student's t-test (equal variance)"
+  )
+
   #conditional statistics
   sts <- reactive({
-    
-    #case when non-normal heteroskedastic data (p < 0.05 for both test) and more than 2 groups
-    if (!is.null(shapiro()$p.value) && !is.null(levene()$p) &&
-        shapiro()$p.value < 0.05 && levene()$p < 0.05 && 
-        length(unique(df_long()$group)) > 2) {
-      test_used("Dunn's non-parametric, multiple comparison test")
-      df_long() |> group_by(test) |>
-        dunn_test(vals ~ group, p.adjust.method = "BH") |>
-        add_xy_position()
-      
-      #case when non-normal heteroskedastic data (p < 0.05 for both test) and 2 groups
-    } else if (!is.null(shapiro()$p.value) && !is.null(levene()$p) &&
-               shapiro()$p.value < 0.05 && levene()$p < 0.05 && 
-               length(unique(df_long()$group)) == 2) {
-      test_used("Wilcoxon non-parametric test")
-      df_long() |> group_by(test) |>
-        wilcox_test(vals ~ group, paired = FALSE) |>
-        add_xy_position()
-      
-      #case when normal but heteroskedastic data (levene()$p < 0.05)
-    } else if (!is.null(levene()$p) && levene()$p < 0.05) {
-      test_used("Two-sided t-test with unequal variance")
-      df_long() |> group_by(test) |>
-        t_test(vals ~ group, var.equal = FALSE) |>
-        add_xy_position()
-      
-      #case when normal and homoskedastic data (p > 0.05 for both test)
-    } else {
-      test_used("Two-sided t-test with equal variance")
-      df_long() |> group_by(test) |>
-        t_test(vals ~ group) |>
-        add_xy_position()
-    }
+    d <- df_long() |> group_by(test)
+
+    switch(
+      stat_choice(),
+      dunn    = d |> dunn_test(vals ~ group, p.adjust.method = "BH"),
+      wilcox  = d |> wilcox_test(vals ~ group, paired = FALSE),
+      welch   = d |> t_test(vals ~ group, var.equal = FALSE),
+      #rstatix::t_test defaults to var.equal = FALSE, so state it explicitly
+      student = d |> t_test(vals ~ group, var.equal = TRUE)
+    ) |> add_xy_position()
   })
-  
+
   output$testUsed <- renderText({
-    paste("Statistical test used:", test_used())
+    paste("Statistical test used:", test_labels[[stat_choice()]])
   })
   
-  
-  shinyjs::enable("downloadData1")
-  shinyjs::enable("downloadData2")
-  shinyjs::enable("downloadData3")
   
   #plot 1
   reactivePlot1 <- reactive({
@@ -316,34 +357,25 @@ server <- function(input, output, session) {
   
   
   #plot2
+  #The two former branches differed only in which p-value column to label with:
+  #rstatix reports an adjusted p ("p.adj") for >2 groups and a raw p otherwise.
   reactivePlot2 <- reactive({
-    
-    #case when more than 2 groups
-    if (length(unique(df_long()$group)) > 2) {
-      ggplot(df_long(), aes(group, vals)) +
-        geom_violin(aes(fill = group)) +
-        geom_point(position = position_jitter(width = 0.2)) + 
-        facet_wrap(~test) + 
-        scale_fill_manual(values = pal) + 
-        scale_y_continuous(limits = c(0, max(1.4 * df_long()$vals)), expand = c(0, 0)) +
-        add_pvalue(sts(), label = 'p.adj', bracket.size = 0.4, label.size = 3) +
-        labs(title = "Fig 2. Behavioral data group comparison") +
-        theme_2
-      
-      #case when 2 groups
-    } else {
-      ggplot(df_long(), aes(group, vals)) +
-        geom_violin(aes(fill = group)) +
-        geom_point(position = position_jitter(width = 0.2)) + 
-        facet_wrap(~test) + 
-        scale_fill_manual(values = pal) + 
-        scale_y_continuous(limits = c(0, max(1.4 * df_long()$vals)), expand = c(0, 0)) +
-        add_pvalue(sts(), label = 'p', bracket.size = 0.4, label.size = 3) +
-        labs(title = "Fig 2. Behavioral data group comparison") +
-        theme_2
-    }
+    p_col <- if (length(unique(df_long()$group)) > 2) "p.adj" else "p"
+
+    ggplot(df_long(), aes(group, vals)) +
+      geom_violin(aes(fill = group)) +
+      geom_point(position = position_jitter(width = 0.2)) +
+      #free_y: the behavioural tests are on different scales, so a shared axis
+      #flattens the ones with the smaller range into an unreadable strip
+      facet_wrap(~test, scales = "free_y") +
+      scale_fill_manual(values = pal) +
+      #headroom at the top so the significance brackets are not clipped
+      scale_y_continuous(expand = expansion(mult = c(0.08, 0.18))) +
+      add_pvalue(sts(), label = p_col, bracket.size = 0.4, label.size = 3) +
+      labs(title = "Fig 2. Behavioral data group comparison") +
+      theme_2
   })
-  
+
   #display plot2
   output$plot2 <- renderPlot({
     print(reactivePlot2())
@@ -392,7 +424,6 @@ server <- function(input, output, session) {
     },
     content = function(file) {
       p1 <- isolate(reactivePlot1())
-      g <- ggplot_build(p1)
       
       plot_width <- 4
       plot_height <- length(unique(df_long()$group)) * 1.5
@@ -410,7 +441,6 @@ server <- function(input, output, session) {
     },
     content = function(file) {
       p2 <- isolate(reactivePlot2())  # Correctly isolate plot 2
-      g <- ggplot_build(p2)  # Get the plot build object
       
       plot_width <- length(unique(df_long()$test)) * 1.5
       plot_height <- length(unique(df_long()$test)) * 1.5
@@ -428,7 +458,6 @@ server <- function(input, output, session) {
     },
     content = function(file) {
       p3 <- isolate(reactivePlot3())
-      g <- ggplot_build(p3)
       
       # Dynamically adjust the plot size
       plot_width <- length(unique(df_long()$test)) * 1.5
