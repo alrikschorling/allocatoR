@@ -1,0 +1,5 @@
+# Run the whole suite. From the repository root:  Rscript tests/run-tests.R
+source("tests/helper.R")
+run_suite(c("tests/test-allocation.R",
+            "tests/test-statistics.R",
+            "tests/test-validation.R"))

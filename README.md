@@ -102,6 +102,18 @@ R -e 'shiny::runApp(launch.browser = TRUE)'
 into a project-local library, so it will not disturb your system R installation.
 It only needs to be run once, or after `renv.lock` changes.
 
+## Tests
+
+```bash
+Rscript tests/run-tests.R
+```
+
+The suite drives the app through `shiny::testServer` against `test_data.csv` and
+covers allocation balance and reproducibility, the per-measure assumption checks
+and test selection, every upload-validation path, and that each figure builds and
+downloads as a valid PDF. It needs no packages beyond the app's own, and runs on
+every push via [GitHub Actions](.github/workflows/tests.yml).
+
 ## License
 
 [MIT](LICENSE)
