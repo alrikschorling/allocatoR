@@ -92,8 +92,8 @@ Dependencies are pinned with [renv](https://rstudio.github.io/renv/). Clone the
 repository, restore the library, then start the app:
 
 ```bash
-git clone https://github.com/alrikschorling/allocatorR.git
-cd allocatorR
+git clone https://github.com/alrikschorling/allocatoR.git
+cd allocatoR
 R -e 'renv::restore()'
 R -e 'shiny::runApp(launch.browser = TRUE)'
 ```

@@ -135,8 +135,8 @@ ui <- fluidPage(
               placeholder = "Eg. Lesion, Control"),  # Comma-separated input
     textInput("group_sizes", "Number of rats in each group (comma-separated)", 
               placeholder = "E.g. 5,5"),  # Comma-separated input for sizes
-    selectInput("set_seed", "Set seed (for reproducibility)", 
-                choices = c(123, 69, 111), selected = 123),
+    numericInput("set_seed", "Set seed (for reproducibility)",
+                 value = 123, step = 1),
     
     #action buttons
     actionButton("process_data", "Process Data", class = "btn-primary"),
@@ -177,10 +177,42 @@ server <- function(input, output, session) {
   #function to read and process CSV files
   df <- reactive({
     req(input$file1)
-    files <- input$file1
-    df <- read.csv(files$datapath) |> 
-      rename_with(tolower) |>
-      mutate(rat_id = factor(rat_id)) 
+    shinyFeedback::hideFeedback("file1")
+
+    raw <- tryCatch(read.csv(input$file1$datapath), error = function(e) e)
+    #need() evaluates its message eagerly, so the message has to be extracted
+    #before the check rather than inside it
+    read_error <- if (inherits(raw, "error")) conditionMessage(raw) else NULL
+    validate(need(is.null(read_error),
+                  paste("Could not read the CSV file:", read_error)))
+
+    raw <- raw |> rename_with(tolower)
+
+    #Check the shape up front. Without this, a missing rat_id surfaces as an
+    #obscure dplyr error and a non-numeric column silently turns the whole
+    #value column into text once the data is pivoted to long format.
+    validate(
+      need("rat_id" %in% names(raw),
+           paste("The first column must be named 'rat_id'. Found:",
+                 paste(names(raw), collapse = ", "))),
+      need(ncol(raw) >= 2,
+           "The file needs at least one behavioural measure besides 'rat_id'.")
+    )
+
+    measures <- setdiff(names(raw), "rat_id")
+    non_numeric <- measures[!vapply(raw[measures], is.numeric, logical(1))]
+    validate(
+      need(length(non_numeric) == 0,
+           paste0("Every column except 'rat_id' must be numeric. ",
+                  "These are not: ", paste(non_numeric, collapse = ", "),
+                  ". Check that the file uses dots as decimal separators ",
+                  "and commas as cell separators.")),
+      need(!anyNA(raw[measures]),
+           "The behavioural measures contain missing values; anticlustering needs a complete table."),
+      need(!anyDuplicated(raw$rat_id), "rat_id values must be unique.")
+    )
+
+    raw |> mutate(rat_id = factor(rat_id))
   })
   
   #display unique number of rat_id
@@ -196,6 +228,7 @@ server <- function(input, output, session) {
     group_sizes <- as.numeric(strsplit(input$group_sizes, ",\\s*")[[1]])
     
     #set the seed (for reproducibility)
+    req(input$set_seed)
     set.seed(input$set_seed)
     
     #validate that group sizes and number of names matches the input number of groups
@@ -391,7 +424,6 @@ server <- function(input, output, session) {
     },
     content = function(file) {
       p1 <- isolate(reactivePlot1())
-      g <- ggplot_build(p1)
       
       plot_width <- 4
       plot_height <- length(unique(df_long()$group)) * 1.5
@@ -409,7 +441,6 @@ server <- function(input, output, session) {
     },
     content = function(file) {
       p2 <- isolate(reactivePlot2())  # Correctly isolate plot 2
-      g <- ggplot_build(p2)  # Get the plot build object
       
       plot_width <- length(unique(df_long()$test)) * 1.5
       plot_height <- length(unique(df_long()$test)) * 1.5
@@ -427,7 +458,6 @@ server <- function(input, output, session) {
     },
     content = function(file) {
       p3 <- isolate(reactivePlot3())
-      g <- ggplot_build(p3)
       
       # Dynamically adjust the plot size
       plot_width <- length(unique(df_long()$test)) * 1.5
